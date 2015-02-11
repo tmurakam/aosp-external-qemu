@@ -10,19 +10,27 @@ set -e
 export LANG=C
 export LC_ALL=C
 
-VERBOSE=0
+PROGDIR=$(dirname "$0")
+VERBOSE=1
 
+BUILD_QEMU_ANDROID=
 MINGW=
 NO_TESTS=
 OUT_DIR=objs
 
 for OPT; do
     case $OPT in
+        --build-qemu-android)
+            BUILD_QEMU_ANDROID=true
+            ;;
         --mingw)
             MINGW=true
             ;;
         --verbose)
             VERBOSE=$(( $VERBOSE + 1 ))
+            ;;
+        --verbosity=*)
+            VERBOSE=${OPT##--verbosity=}
             ;;
         --no-tests)
             NO_TESTS=true
@@ -42,7 +50,7 @@ panic () {
 }
 
 run () {
-  if [ "$VERBOSE" -ge 1 ]; then
+  if [ "$VERBOSE" -gt 1 ]; then
     "$@"
   else
     "$@" >/dev/null 2>&1
@@ -54,7 +62,7 @@ case $HOST_OS in
     Linux)
         HOST_NUM_CPUS=`cat /proc/cpuinfo | grep processor | wc -l`
         ;;
-    Darwin|FreeBsd)
+    Darwin|FreeBSD)
         HOST_NUM_CPUS=`sysctl -n hw.ncpu`
         ;;
     CYGWIN*|*_NT-*)
@@ -64,6 +72,22 @@ case $HOST_OS in
         HOST_NUM_CPUS=1
 esac
 
+case $HOST_OS in
+    Linux)
+        HOST_SYSTEM=linux
+        ;;
+    Darwin)
+        HOST_SYSTEM=darwin
+        ;;
+    FreeBSD)
+        HOST_SYSTEM=freebsd
+        ;;
+    CYGWIN*|*_NT-*)
+        HOST_SYSTEM=windows
+        ;;
+    *)
+        panic "Host system is not supported: $HOST_OS"
+esac
 
 # Return the type of a given file, using the /usr/bin/file command.
 # $1: executable path.
@@ -101,15 +125,98 @@ else
 fi
 
 # Build the binaries from sources.
-cd `dirname $0`
+cd "$PROGDIR"
 rm -rf objs
 echo "Configuring build."
+export IN_ANDROID_REBUILD_SH=1
 run ./android-configure.sh --out-dir=$OUT_DIR "$@" ||
     panic "Configuration error, please run ./android-configure.sh to see why."
 
 echo "Building sources."
 run make -j$HOST_NUM_CPUS OBJS_DIR="$OUT_DIR" ||
     panic "Could not build sources, please run 'make' to see why."
+
+if [ "$BUILD_QEMU_ANDROID" ]; then
+    # Rebuild qemu-android binaries.
+    echo "Building qemu-android binaries."
+    unset ANDROID_EMULATOR_DARWIN_SSH &&
+    $PROGDIR/android/scripts/build-qemu-android.sh \
+        --verbosity=$VERBOSE \
+        --host=$HOST_SYSTEM-x86_64 \
+        --force
+fi
+
+# Copy qemu-android binaries, if any.
+PREBUILTS_DIR=$ANDROID_EMULATOR_PREBUILTS_DIR
+if [ -z "$PREBUILTS_DIR" ]; then
+PREBUILTS_DIR=/tmp/$USER-emulator-prebuilts
+fi
+QEMU_ANDROID_HOSTS=
+QEMU_ANDROID_BINARIES=
+if [ -d "$PREBUILTS_DIR/qemu-android" ]; then
+    HOST_PREFIX=
+    if [ "$MINGW" ]; then
+        HOST_PREFIX=windows
+    else
+        HOST_PREFIX=$HOST_SYSTEM
+    fi
+    if [ "$HOST_PREFIX" ]; then
+        QEMU_ANDROID_BINARIES=$(cd "$PREBUILTS_DIR"/qemu-android && ls $HOST_PREFIX-*/qemu-system-* 2>/dev/null || true)
+    fi
+fi
+if [ -z "$QEMU_ANDROID_BINARIES" ]; then
+    echo "WARNING: Missing qemu-android prebuilts. Please run rebuild-qemu-android.sh!"
+else
+    echo "Copying prebuilt $HOST_PREFIX qemu-android binaries to $OUT_DIR/qemu/"
+    for QEMU_ANDROID_BINARY in $QEMU_ANDROID_BINARIES; do
+        run mkdir -p "$OUT_DIR/qemu/$(dirname "$QEMU_ANDROID_BINARY")" &&
+        run cp "$PREBUILTS_DIR"/qemu-android/$QEMU_ANDROID_BINARY \
+                $OUT_DIR/qemu/$QEMU_ANDROID_BINARY ||
+            panic "Could not copy $HOST_PREFIX/$QEMU_ANDROID_BINARY !?"
+    done
+fi
+
+if [ -d "$PREBUILTS_DIR/mesa" ]; then
+    MESA_HOST=$HOST_SYSTEM
+    if [ "$MINGW" ]; then
+        MESA_HOST=windows
+    fi
+    case $MESA_HOST in
+        windows)
+            MESA_LIBNAME=opengl32.dll
+            ;;
+        linux)
+            MESA_LIBNAME=libGL.so
+            ;;
+        *)
+            MESA_LIBNAME=
+    esac
+    if [ "$MESA_LIBNAME" ]; then
+        for MESA_ARCH in x86 x86_64; do
+            if [ "$MESA_ARCH" = "x86" ]; then
+                MESA_LIBDIR=lib
+            else
+                MESA_LIBDIR=lib64
+            fi
+            MESA_LIBRARY=$(ls "$PREBUILTS_DIR/mesa/$MESA_HOST-$MESA_ARCH/lib/$MESA_LIBNAME" 2>/dev/null || true)
+            if [ "$MESA_LIBRARY" ]; then
+                MESA_DSTDIR="$OUT_DIR/$MESA_LIBDIR/gles_mesa"
+                echo "Copying $MESA_HOST-$MESA_ARCH Mesa library to $MESA_DSTDIR"
+                run mkdir -p "$MESA_DSTDIR" &&
+                run cp -f "$MESA_LIBRARY" "$MESA_DSTDIR/$MESA_LIBNAME"
+                if [ "$MESA_HOST" = "linux" ]; then
+                    # Special handling for Linux, this is needed because SDL
+                    # will actually try to load libGL.so.1 before GPU emulation
+                    # is initialized. This is actually a link to the system's
+                    # libGL.so, and will thus prevent the Mesa version from
+                    # loading. By creating the symlink, Mesa will also be used
+                    # by SDL.
+                    run ln -sf libGL.so "$MESA_DSTDIR/libGL.so.1"
+                fi
+            fi
+        done
+    fi
+fi
 
 RUN_32BIT_TESTS=
 RUN_64BIT_TESTS=true
@@ -191,10 +298,10 @@ if [ -z "$NO_TESTS" ]; then
             FAILURES="$FAILURES emugen-binary"
         else
             # The first case is for a remote build with package-release.sh
-            TEST_SCRIPT=$(dirname "$0")/../opengl/host/tools/emugen/tests/run-tests.sh
+            TEST_SCRIPT=$PROGDIR/../opengl/host/tools/emugen/tests/run-tests.sh
             if [ ! -f "$TEST_SCRIPT" ]; then
                 # This is the usual location.
-                TEST_SCRIPT=$(dirname "$0")/distrib/android-emugl/host/tools/emugen/tests/run-tests.sh
+                TEST_SCRIPT=$PROGDIR/distrib/android-emugl/host/tools/emugen/tests/run-tests.sh
             fi
             if [ ! -f "$TEST_SCRIPT" ]; then
                 echo " FAIL: Missing script: $TEST_SCRIPT"
@@ -206,6 +313,36 @@ if [ -z "$NO_TESTS" ]; then
         fi
     fi
 
+    # Check that the windows executables all have icons.
+    # First need to locate the windres tool.
+    if [ "$MINGW" ]; then
+        echo "Checking windows executables icons."
+        if [ ! -f "$OUT_DIR/config.make" ]; then
+            echo "FAIL: Could not find \$OUT_DIR/config.make !?"
+            FAILURES="$FAILURES out-dir-config-make"
+        else
+            WINDRES=$(awk '/^HOST_WINDRES:=/ { print $2; } $1 == "HOST_WINDRES" { print $3; }' $OUT_DIR/config.make) ||
+            if true; then
+                echo "FAIL: Could not find host 'windres' program"
+                FAILURES="$FAILURES host-windres"
+            fi
+            EXECUTABLES="emulator.exe emulator-arm.exe emulator-x86.exe emulator-mips.exe"
+            EXECUTABLES="$EXECUTABLES emulator64-arm.exe emulator64-x86.exe emulator64-mips.exe"
+            EXPECTED_ICONS=14
+            for EXEC in $EXECUTABLES; do
+                if [ ! -f "$OUT_DIR"/$EXEC ]; then
+                    echo "FAIL: Missing windows executable: $EXEC"
+                    FAILURES="$FAILURES windows-$EXEC"
+                else
+                    NUM_ICONS=$($WINDRES --input-format=coff --output-format=rc $OUT_DIR/$EXEC | grep RT_ICON | wc -l)
+                    if [ "$NUM_ICONS" != "$EXPECTED_ICONS" ]; then
+                        echo "FAIL: Invalid icon count in $EXEC ($NUM_ICONS, expected $EXPECTED_ICONS)"
+                        FAILURES="$FAILURES windows-$EXEC-icons"
+                    fi
+                fi
+            done
+        fi
+    fi
     if [ "$FAILURES" ]; then
         panic "Unit test failures: $FAILURES"
     fi

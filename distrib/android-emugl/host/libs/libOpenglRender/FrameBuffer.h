@@ -73,6 +73,13 @@ public:
     HandleType createRenderContext(int p_config, HandleType p_share, bool p_isGL2 = false);
     HandleType createWindowSurface(int p_config, int p_width, int p_height);
     HandleType createColorBuffer(int p_width, int p_height, GLenum p_internalFormat);
+
+    // Destroy all the remaining contexts that are created by current render thread
+    void drainRenderContext();
+
+    // Destroy all the remaining window surfaces that are created by current render thread
+    void drainWindowSurface();
+
     void DestroyRenderContext(HandleType p_context);
     void DestroyWindowSurface(HandleType p_surface);
     int openColorBuffer(HandleType p_colorbuffer);
@@ -83,6 +90,9 @@ public:
     bool  flushWindowSurfaceColorBuffer(HandleType p_surface);
     bool  bindColorBufferToTexture(HandleType p_colorbuffer);
     bool  bindColorBufferToRenderbuffer(HandleType p_colorbuffer);
+    void  readColorBuffer(HandleType p_colorbuffer,
+                           int x, int y, int width, int height,
+                           GLenum format, GLenum type, void *pixels);
     bool updateColorBuffer(HandleType p_colorbuffer,
                            int x, int y, int width, int height,
                            GLenum format, GLenum type, void *pixels);

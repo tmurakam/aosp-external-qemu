@@ -22,6 +22,12 @@
 #include "GL2Decoder.h"
 #include "renderControl_dec.h"
 
+#include <set>
+
+typedef uint32_t HandleType;
+typedef std::set<HandleType> ThreadContextSet;
+typedef std::set<HandleType> WindowSurfaceSet;
+
 // A class used to model the state of each RenderThread related
 struct RenderThreadInfo {
     // Create new instance. Only call this once per thread.
@@ -44,6 +50,11 @@ struct RenderThreadInfo {
     GLDecoder                       m_glDec;
     GL2Decoder                      m_gl2Dec;
     renderControl_decoder_context_t m_rcDec;
+
+    // all the contexts that are created by this render thread
+    ThreadContextSet                m_contextSet;
+    // all the window surfaces that are created by this render thread
+    WindowSurfaceSet                m_windowSet;
 };
 
 #endif
